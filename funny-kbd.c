@@ -5,17 +5,61 @@
 #include <linux/workqueue.h>
 #include <uapi/linux/input-event-codes.h>
 #include <linux/input.h>
+#include <linux/kprobes.h>
 
 MODULE_LICENSE("GPL");
 
+static unsigned long kallsyms_lookup_name_hack(const char *name)
+{
+    struct kprobe kp = {
+        .symbol_name = "kallsyms_lookup_name"
+    };
+    unsigned long addr = 0;
+
+    if (register_kprobe(&kp) < 0)
+    {
+        pr_err("Failed to register kprobe on kallsyms_lookup_name\n");
+        return 0;
+    }
+
+    addr = (unsigned long)kp.addr;
+
+    unregister_kprobe(&kp);
+
+    return addr;
+}
+
+static unsigned short **get_key_maps(void)
+{
+    typedef unsigned long (*kallsyms_fn)(const char *);
+    kallsyms_fn lookup = (kallsyms_fn)kallsyms_lookup_name_hack("kallsyms_lookup_name");
+
+    if (!lookup)
+        return NULL;
+
+    unsigned long addr = lookup("key_maps");
+    if (!addr)
+        return NULL;
+
+    return (unsigned short **)addr;
+}
+
+static unsigned short **maps;
+
 static struct input_dev *virt_kbd;
 
-unsigned int eng_word[] = {
+unsigned int russian_word[] = {
+    KEY_COMMA,
+    KEY_K,
+    KEY_B,
+    KEY_Y};
+
+unsigned int english_word[] = {
+    KEY_S,
     KEY_H,
-    KEY_E,
-    KEY_L,
-    KEY_L,
-    KEY_O};
+    KEY_I,
+    KEY_T,
+};
 
 static void send_keys(struct input_dev *kbd, unsigned int *keys, size_t num)
 {
@@ -39,17 +83,33 @@ struct kb_work
 
 static void kb_work_fn(struct work_struct *work)
 {
+    bool place_russian = false;
 
     struct kb_work *kw =
         container_of(work, struct kb_work, work);
 
-    pr_info("funny-kbd: action = %lu keycode = %u  shift = %d\n", kw->action, kw->keycode, kw->shift);
+    unsigned short symbol = maps[kw->shift][kw->keycode];
 
-    if (kw->keycode == KEY_COMMA)
+    if (maps[kw->shift][27] == 0x42a || maps[kw->shift][27] == 0x44a)
     {
-        send_keys(virt_kbd, eng_word, sizeof(eng_word) / sizeof(unsigned int));
+        place_russian = true;
+    }
+    else
+    {
+        place_russian = false;
     }
 
+    pr_info("funny-kbd: keycode=%u action=%lu shift=%d symbol=%hx place_russian=%d\n",
+            kw->keycode, kw->action, kw->shift, symbol, place_russian);
+
+    if (kw->keycode == KEY_COMMA && !place_russian && symbol == 0xf02c)
+    {
+        send_keys(virt_kbd, english_word, sizeof(english_word) / sizeof(unsigned int));
+    }
+    else if (kw->keycode == KEY_SLASH && place_russian && symbol == 0xf02c)
+    {
+        send_keys(virt_kbd, russian_word, sizeof(russian_word) / sizeof(unsigned int));
+    }
     kfree(kw);
 }
 
@@ -122,6 +182,7 @@ static int init_virt_kbd(void)
 static int __init funny_kbd_init(void)
 {
     pr_info("funny-kbd: Module loaded\n");
+    maps = get_key_maps();
     kb_wq = alloc_workqueue("kb_wq", WQ_UNBOUND, 1);
     if (!kb_wq)
         return -ENOMEM;
@@ -135,7 +196,7 @@ static void __exit funny_kbd_exit(void)
 
     input_unregister_device(virt_kbd);
     input_free_device(virt_kbd);
-    
+
     flush_workqueue(kb_wq);
     destroy_workqueue(kb_wq);
 
